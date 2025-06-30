@@ -11,7 +11,7 @@
 ###################################
 seed: 1234
 __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
-output_folder: !ref ./results/encodec/<seed>
+output_folder: !ref /home/fbougares/jsalt25/speechbrain_exps/results/encodec/<seed>
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 epochs: 700
@@ -47,12 +47,12 @@ progress_batch_sample_size: 3
 #################################
 # Data files and pre-processing #
 #################################
-data_folder: !PLACEHOLDER # e.g, /localscratch/LibriTTS/
+data_folder: /home/fbougares/jsalt25/speechbrain_exps/data # e.g, /localscratch/LibriTTS/
 
 # Files to hold the manifest data
-train_json: !ref <save_folder>/train.csv
-valid_json: !ref <save_folder>/valid.csv
-test_json: !ref <save_folder>/test.csv
+train_csv: !ref <data_folder>/train.csv
+valid_csv: !ref <data_folder>/valid.csv
+test_csv: !ref <data_folder>/test.csv
 
 # Files to hold the speaker embeddings - corresponding to the data manifest files
 #train_speaker_embeddings_pickle: !ref <save_folder>/train_speaker_embeddings.pickle
@@ -77,7 +77,7 @@ avoid_if_longer_than: 10.0
 ################################
 # Audio Parameters             #
 ################################
-sample_rate: 16000
+sample_rate: 24000
 hop_length: 256
 win_length: 1024
 n_mel_channels: 80
@@ -108,7 +108,7 @@ spk_emb_encoder: speechbrain/spkrec-ecapa-voxceleb
 ################################
 learning_rate: 0.001
 weight_decay: 0.000006
-batch_size: 32 #minimum 2
+batch_size: 1 #minimum 2
 mask_padding: True
 guided_attention_sigma: 0.2
 guided_attention_weight: 25.0
@@ -120,23 +120,18 @@ spk_emb_loss_weight: 1.0
 train_dataloader_opts:
   batch_size: !ref <batch_size>
   drop_last: True  #True #False
-  num_workers: 8
-  collate_fn: !new:speechbrain.lobes.models.MSTacotron2.TextMelCollate
-    speaker_embeddings_pickle: !ref <train_speaker_embeddings_pickle>
+  num_workers: 0
 
 valid_dataloader_opts:
   batch_size: !ref <batch_size>
   drop_last: True
-  num_workers: 8
-  collate_fn: !new:speechbrain.lobes.models.MSTacotron2.TextMelCollate
-    speaker_embeddings_pickle: !ref <valid_speaker_embeddings_pickle>
+  num_workers: 0
+
 
 test_dataloader_opts:
   batch_size: !ref <batch_size>
   drop_last: True
-  num_workers: 8
-  collate_fn: !new:speechbrain.lobes.models.MSTacotron2.TextMelCollate
-    speaker_embeddings_pickle: !ref <test_speaker_embeddings_pickle>
+  num_workers: 0
 
 ###############################
 # Model Parameters and model  #
@@ -174,7 +169,7 @@ postnet_kernel_size: 5
 postnet_n_convolutions: 10
 
 # To compute the mel-spectrogram for an audio
-mel_spectogram: !name:speechbrain.lobes.models.Tacotron2.mel_spectogram
+mel_spectogram: !name:speechbrain.lobes.models.HifiGAN.mel_spectogram
   sample_rate: !ref <sample_rate>
   hop_length: !ref <hop_length>
   win_length: !ref <win_length>
@@ -190,25 +185,25 @@ mel_spectogram: !name:speechbrain.lobes.models.Tacotron2.mel_spectogram
 
 
 encoder: !new:speechbrain.lobes.models.Encodec.EncodecEncoder
-  channels: 1 #!ref <>
-  dimension: 128 #!ref <>
-  n_filters: 32 #!ref <>
-  n_residual_layers: 1
-  ratios: [8, 5, 4 ,2]
-  activation: 'ELU'
-  activation_params: {}
-  norm: 'weight_norm'
-  norm_params:
-  kernel_size: 7
-  causal: False
-  pad_mode: False
-  true_skip: False
-  compress: 2
-  lstm: 2
+
+  # channels: 1 #!ref <>
+  # dimension: 128 #!ref <>
+  # n_filters: 32 #!ref <>
+  # n_residual_layers: 1
+  # ratios: [8, 5, 4 ,2]
+  # activation: 'ELU'
+  # norm: 'weight_norm'
+  # norm_params:
+  # kernel_size: 7
+  # causal: False
+  # pad_mode: False
+  # true_skip: False
+  # compress: 2
+  # lstm: 2
 
 # Overall modules used
 modules:
-  model: !ref <encoder>
+  encoder: !ref <encoder>
 
 # Optimizer
 opt_class: !name:torch.optim.Adam
@@ -232,7 +227,7 @@ lr_annealing: !new:speechbrain.nnet.schedulers.NoamScheduler
 checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
   checkpoints_dir: !ref <save_folder>
   recoverables:
-    model: !ref <model>
+    model: !ref <encoder>
     counter: !ref <epoch_counter>
     scheduler: !ref <lr_annealing>
 

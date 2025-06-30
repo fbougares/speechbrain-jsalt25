@@ -26,21 +26,6 @@ logger = get_logger(__name__)
 class EncodecBrain(sb.Brain):
     """The Brain implementation for Encodec"""
     
-    def on_fit_start(self):
-        """
-            Gets called at the beginning of ``fit()``, on multiple processes
-            if ``distributed_count > 0`` and backend is ddp and initializes statistics
-        """
-        
-        self.hparams.progress_sample_logger.reset()
-        self.last_epoch = 0
-        self.last_batch = None
-        self.last_preds = None
-        
-        self.last_loss_stats = {}
-        
-        return super().on_fit_start()
-
     def compute_forward(self, batch, stage):
         """
         Computes the forward pass
@@ -56,12 +41,18 @@ class EncodecBrain(sb.Brain):
         -------
         the model output
         """
-        pass
+        
+        batch = batch.to(self.device)
+        wavs, wav_lens = batch.audio
+        print("Input wav shape", wavs.shape)
+        feats = self.modules.encoder(wavs)
+        
+        print("Feats shape", feats.shape)
+        
+        return feats
+
     
-    def fit_batch(self, batch):
-        pass
-    
-    def compute_objectives(self, predictions, batch, stage):
+    def compute_objectives(self, batch, stage):
         """
         Computes the loss given the predicted and targeted outputs
 
@@ -79,15 +70,19 @@ class EncodecBrain(sb.Brain):
         loss : torch.Tensor
             A one-element tensor used for back-propagating the gradient
         """
-        pass 
+        wav, wav_lens = batch
+        
 
-
+    def fit_batch(self, batch):
+        feats = self.compute_forward(batch, sb.Stage.TRAIN)
+        return feats
+    
 ############### The data preparation method ########################
 def dataio_prepare(hparams):
     # Define audio pipeline:
 
     @sb.utils.data_pipeline.takes("wav")
-    @sb.utils.data_pipeline.provides("mel_spec", "sig") #  mel_spec is 80 dim / sig dim is 16khz or 24khz
+    @sb.utils.data_pipeline.provides("mel_spec", "audio") #  mel_spec is 80 dim / sig dim is 16khz or 24khz
     def audio_pipeline(wav):
 
         audio, sig_sr = torchaudio.load(wav)
@@ -95,7 +90,7 @@ def dataio_prepare(hparams):
             audio = torchaudio.functional.resample(
                 audio, sig_sr, hparams["sample_rate"]
             )
-
+        print("Audio shape read ", audio.shape)
         mel_spec = hparams["mel_spectogram"](audio=audio.squeeze())
 
 
@@ -112,11 +107,10 @@ def dataio_prepare(hparams):
             csv_path=data_info[dataset],
             replacements={"data_root": hparams["data_folder"]},
             dynamic_items=[audio_pipeline],
-            output_keys=["mel_spec", "audio", "uttid"],
+            output_keys=["mel_spec", "audio"],
         )
 
         datasets[dataset] = datasets[dataset].filtered_sorted(
-            sort_key="duration",
             key_max_value={"duration": hparams["avoid_if_longer_than"]},
         )
 
@@ -133,7 +127,7 @@ if __name__ == '__main__':
 
     # If --distributed_launch then
     # create ddp_group with the right communication protocol
-    sb.utils.distributed.ddp_init_group(run_opts)
+    ### Fethi sb.utils.distributed.ddp_init_group(run_opts)
 
     # Create experiment directory
     sb.create_experiment_directory(
