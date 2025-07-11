@@ -18,280 +18,22 @@ import typing as tp
 from torch import nn
 from pathlib import Path
 from torch.nn import functional as F
-from torch.nn.utils import spectral_norm, weight_norm
+from torch.nn.utils import spectral_norm
+from torch.nn.utils.parametrizations import weight_norm
 
 
+from speechbrain.lobes.models.Encodec_utils import SEANetResnetBlock, SConv1d, SLSTM, SConvTranspose1d, LMModel, _check_checksum, _get_checkpoint_url
+from speechbrain.quantization.vq import ResidualVectorQuantizer
 
-CONV_NORMALIZATIONS = frozenset(['none', 'weight_norm', 'spectral_norm','time_layer_norm', 'layer_norm', 'time_group_norm'])
+import logging
 
-################ Functions utils  ##################################################@
-    
-def get_norm_module(module: nn.Module, causal: bool = False, norm: str = 'none', **norm_kwargs) -> nn.Module:
-    """Return the proper normalization module. If causal is True, this will ensure the returned
-    module is causal, or return an error if the normalization doesn't support causal evaluation.
-    """
-    assert norm in CONV_NORMALIZATIONS
-    if norm == 'layer_norm':
-        assert isinstance(module, nn.modules.conv._ConvNd)
-        return ConvLayerNorm(module.out_channels, **norm_kwargs)
-    elif norm == 'time_group_norm':
-        if causal:
-            raise ValueError("GroupNorm doesn't support causal evaluation.")
-        assert isinstance(module, nn.modules.conv._ConvNd)
-        return nn.GroupNorm(1, module.out_channels, **norm_kwargs)
-    else:
-        return nn.Identity()
-    
-def apply_parametrization_norm(module: nn.Module, norm: str = 'none') -> nn.Module:
-    assert norm in CONV_NORMALIZATIONS
-    if norm == 'weight_norm':
-        return weight_norm(module)
-    elif norm == 'spectral_norm':
-        return spectral_norm(module)
-    else:
-        # We already check was in CONV_NORMALIZATION, so any other choice
-        # doesn't need reparametrization.
-        return module
+logging.getLogger().setLevel(logging.INFO)
 
-def get_extra_padding_for_conv1d(x: torch.Tensor, kernel_size: int, stride: int,
-                                 padding_total: int = 0) -> int:
-    """
-        See `pad_for_conv1d`.
-    """
-    length = x.shape[-1]
-    n_frames = (length - kernel_size + padding_total) / stride + 1
-    ideal_length = (math.ceil(n_frames) - 1) * stride + (kernel_size - padding_total)
-    return ideal_length - length
+ROOT_URL = 'https://dl.fbaipublicfiles.com/encodec/v0/'
+EncodedFrame = tp.Tuple[torch.Tensor, tp.Optional[torch.Tensor]]
 
-
-def pad1d(x: torch.Tensor, paddings: tp.Tuple[int, int], mode: str = 'zero', value: float = 0.):
-    """Tiny wrapper around F.pad, just to allow for reflect padding on small input.
-    If this is the case, we insert extra 0 padding to the right before the reflection happen.
-    """
-    length = x.shape[-1]
-    padding_left, padding_right = paddings
-    assert padding_left >= 0 and padding_right >= 0, (padding_left, padding_right)
-    if mode == 'reflect':
-        max_pad = max(padding_left, padding_right)
-        extra_pad = 0
-        if length <= max_pad:
-            extra_pad = max_pad - length + 1
-            x = F.pad(x, (0, extra_pad))
-        padded = F.pad(x, paddings, mode, value)
-        end = padded.shape[-1] - extra_pad
-        return padded[..., :end]
-    else:
-        return F.pad(x, paddings, mode, value)
-
-def unpad1d(x: torch.Tensor, paddings: tp.Tuple[int, int]):
-    """Remove padding from x, handling properly zero padding. Only for 1d!"""
-    padding_left, padding_right = paddings
-    assert padding_left >= 0 and padding_right >= 0, (padding_left, padding_right)
-    assert (padding_left + padding_right) <= x.shape[-1]
-    end = x.shape[-1] - padding_right
-    return x[..., padding_left: end]
-
-################### Classes needed to create the Encoder   #############################
-
-class ConvLayerNorm(nn.LayerNorm):
-    """
-    Convolution-friendly LayerNorm that moves channels to last dimensions
-    before running the normalization and moves them back to original position right after.
-    """
-    def __init__(self, normalized_shape: tp.Union[int, tp.List[int], torch.Size], **kwargs):
-        super().__init__(normalized_shape, **kwargs)
-
-    def forward(self, x):
-        x = einops.rearrange(x, 'b ... t -> b t ...')
-        x = super().forward(x)
-        x = einops.rearrange(x, 'b t ... -> b ... t')
-        return
-
-class NormConvTranspose1d(nn.Module):
-    """Wrapper around ConvTranspose1d and normalization applied to this conv
-    to provide a uniform interface across normalization approaches.
-    """
-    def __init__(self, *args, causal: bool = False, norm: str = 'none',
-                 norm_kwargs: tp.Dict[str, tp.Any] = {}, **kwargs):
-        super().__init__()
-        self.convtr = apply_parametrization_norm(nn.ConvTranspose1d(*args, **kwargs), norm)
-        self.norm = get_norm_module(self.convtr, causal, norm, **norm_kwargs)
-        self.norm_type = norm
-
-    def forward(self, x):
-        x = self.convtr(x)
-        x = self.norm(x)
-        return x
-
-class SLSTM(nn.Module):
-    """
-    LSTM without worrying about the hidden state, nor the layout of the data.
-    Expects input as convolutional layout.
-    """
-    def __init__(self, dimension: int, num_layers: int = 2, skip: bool = True):
-        super().__init__()
-        self.skip = skip
-        self.lstm = nn.LSTM(dimension, dimension, num_layers)
-
-    def forward(self, x):
-        x = x.permute(2, 0, 1)
-        y, _ = self.lstm(x)
-        if self.skip:
-            y = y + x
-        y = y.permute(1, 2, 0)
-        return y
-
-class NormConv1d(nn.Module):
-    """
-    Wrapper around Conv1d and normalization applied to this conv
-    to provide a uniform interface across normalization approaches.
-    """
-    def __init__(self, *args, causal: bool = False, norm: str = 'none',
-                 norm_kwargs: tp.Dict[str, tp.Any] = {}, **kwargs):
-        super().__init__()
-        self.conv = apply_parametrization_norm(nn.Conv1d(*args, **kwargs), norm)
-        self.norm = get_norm_module(self.conv, causal, norm, **norm_kwargs)
-        self.norm_type = norm
-
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.norm(x)
-        return x
-    
-class SConv1d(nn.Module):
-    """
-    Description : 
-    Args:
-        nn (_type_): _description_
-
-    Returns:
-        _type_: _description_
-    """
-    def __init__(self, in_channels: int, out_channels: int,
-                 kernel_size: int, stride: int = 1, dilation: int = 1,
-                 groups: int = 1, bias: bool = True, causal: bool = False,
-                 norm: str = 'none', norm_kwargs : tp.Dict[str, tp.Any] = {},
-                 pad_mode: str = 'reflect'):
-        super().__init__()
-        ## 
-        # warn user on unusual setup between dilation and stride
-        if stride > 1 and dilation > 1:
-            warnings.warn('SConv1d has been initialized with stride > 1 and dilation > 1'
-                          f'(kernel_size={kernel_size} stride={stride}, dilation={dilation}).')
-        
-        self.conv = NormConv1d(in_channels, out_channels, kernel_size, stride,
-                               dilation=dilation, groups=groups, bias=bias, causal=causal,
-                               norm=norm, norm_kwargs=norm_kwargs)
-        self.causal = causal
-        self.pad_mode = pad_mode
-        
-    def forward(self, x):
-        B, C, T = x.shape
-        kernel_size = self.conv.conv.kernel_size[0]
-        stride = self.conv.conv.stride[0]
-        dilation = self.conv.conv.dilation[0]
-        kernel_size = (kernel_size - 1) * dilation + 1  # effective kernel size with dilations
-        padding_total = kernel_size - stride
-        extra_padding = get_extra_padding_for_conv1d(x, kernel_size, stride, padding_total)
-        if self.causal:
-            # Left padding for causal 
-            x = pad1d(x, (padding_total, extra_padding), mode=self.pad_mode)
-        else:
-            # Asymmetric padding required for odd strides
-            padding_right = padding_total // 2
-            padding_left = padding_total - padding_right
-            x = pad1d(x, (padding_left, padding_right + extra_padding), mode=self.pad_mode)
-            
-        return self.conv(x)
-
-class SConvTranspose1d(nn.Module):
-    """ConvTranspose1d with some builtin handling of asymmetric or causal padding
-    and normalization.
-    """
-    def __init__(self, in_channels: int, out_channels: int,
-                 kernel_size: int, stride: int = 1, causal: bool = False,
-                 norm: str = 'none', trim_right_ratio: float = 1.,
-                 norm_kwargs: tp.Dict[str, tp.Any] = {}):
-        super().__init__()
-        self.convtr = NormConvTranspose1d(in_channels, out_channels, kernel_size, stride,
-                                          causal=causal, norm=norm, norm_kwargs=norm_kwargs)
-        self.causal = causal
-        self.trim_right_ratio = trim_right_ratio
-        assert self.causal or self.trim_right_ratio == 1., \
-            "`trim_right_ratio` != 1.0 only makes sense for causal convolutions"
-        assert self.trim_right_ratio >= 0. and self.trim_right_ratio <= 1.
-
-    def forward(self, x):
-        kernel_size = self.convtr.convtr.kernel_size[0]
-        stride = self.convtr.convtr.stride[0]
-        padding_total = kernel_size - stride
-
-        y = self.convtr(x)
-
-        # We will only trim fixed padding. Extra padding from `pad_for_conv1d` would be
-        # removed at the very end, when keeping only the right length for the output,
-        # as removing it here would require also passing the length at the matching layer
-        # in the encoder.
-        if self.causal:
-            # Trim the padding on the right according to the specified ratio
-            # if trim_right_ratio = 1.0, trim everything from right
-            padding_right = math.ceil(padding_total * self.trim_right_ratio)
-            padding_left = padding_total - padding_right
-            y = unpad1d(y, (padding_left, padding_right))
-        else:
-            # Asymmetric padding required for odd strides
-            padding_right = padding_total // 2
-            padding_left = padding_total - padding_right
-            y = unpad1d(y, (padding_left, padding_right))
-        return y
-    
-class SEANetResnetBlock(nn.Module):
-    """Residual block from SEANet model.
-    Args:
-        dim (int): Dimension of the input/output
-        kernel_sizes (list): List of kernel sizes for the convolutions.
-        dilations (list): List of dilations for the convolutions.
-        activation (str): Activation function.
-        activation_params (dict): Parameters to provide to the activation function
-        norm (str): Normalization method.
-        norm_params (dict): Parameters to provide to the underlying normalization used along with the convolution.
-        causal (bool): Whether to use fully causal convolution.
-        pad_mode (str): Padding mode for the convolutions.
-        compress (int): Reduced dimensionality in residual branches (from Demucs v3)
-        true_skip (bool): Whether to use true skip connection or a simple convolution as the skip connection.
-    """
-    def __init__(self, dim: int, kernel_sizes: tp.List[int] = [3, 1], dilations: tp.List[int] = [1, 1],
-                 activation: str = 'ELU', activation_params: dict = {'alpha': 1.0},
-                 norm: str = 'weight_norm', norm_params: tp.Dict[str, tp.Any] = {}, causal: bool = False,
-                 pad_mode: str = 'reflect', compress: int = 2, true_skip: bool = True):
-        super().__init__()
-        assert len(kernel_sizes) == len(dilations), 'Number of kernel sizes should match number of dilations'
-        act = getattr(nn, activation)
-        hidden = dim // compress
-        block = []
-        for i, (kernel_size, dilation) in enumerate(zip(kernel_sizes, dilations)):
-            in_chs = dim if i == 0 else hidden
-            out_chs = dim if i == len(kernel_sizes) - 1 else hidden
-            block += [
-                act(**activation_params),
-                SConv1d(in_chs, out_chs, kernel_size=kernel_size, dilation=dilation,
-                        norm=norm, norm_kwargs=norm_params,
-                        causal=causal, pad_mode=pad_mode),
-            ]
-        self.block = nn.Sequential(*block)
-        self.shortcut: nn.Module
-        if true_skip:
-            self.shortcut = nn.Identity()
-        else:
-            self.shortcut = SConv1d(dim, dim, kernel_size=1, norm=norm, norm_kwargs=norm_params,
-                                    causal=causal, pad_mode=pad_mode)
-
-    def forward(self, x):
-        return self.shortcut(x) + self.block(x)
-    
-    
-#########################  CREATE THE EnCodec Encoder  ###############################################################
-######################### This will gives the output embedding from the Encoder before the QT module #################
+###################################  CREATE THE EnCodec Encoder  ############################################
+############## This will gives the output embedding Z from the Encoder before the QT module #################
 
 class EncodecEncoder(nn.Module):
     """
@@ -342,15 +84,17 @@ class EncodecEncoder(nn.Module):
         mult = 1 
         
         # Create a list of nn.Module called model 
-        # Add the first SConv1d  convolutional layer -> local feature learning 
+        # Add the first SConv1d  convolutional layer -> local feature learning
+        logging.info(f"First block in the Encoder")
         model: tp.List[nn.Module] = [
             SConv1d(channels, mult * n_filters, kernel_size, norm=norm, norm_kwargs=norm_params,
                     causal=causal, pad_mode=pad_mode)
         ]
-        
+        logging.info(f"Down Sampling blocks in the Encoder {self.ratios}")
         # Downsample to raw audio scale
         for i, ratio in enumerate(self.ratios):
             # Add residual layers
+            logging.info(f"Residual Layers Encoder number {i}")
             for j in range(n_residual_layers):
                 model += [
                     SEANetResnetBlock(mult * n_filters, kernel_sizes=[residual_kernel_size, 1],
@@ -361,6 +105,7 @@ class EncodecEncoder(nn.Module):
                     ]
 
             # Add downsampling layers
+            logging.info(f"Down Sampling Layers Encoder number {i}")
             model += [
                 act(**activation_params),
                 SConv1d(mult * n_filters, mult * n_filters * 2,
@@ -372,9 +117,11 @@ class EncodecEncoder(nn.Module):
         
         # Adding two LSTM layers on top of the convolution blocks 
         if lstm:
+            logging.info(f"Adding {lstm} LSTM Layers Encoder number")
             model += [SLSTM(mult * n_filters, num_layers=lstm)]
         
         # Adding the final Conv 1D layer 
+        logging.info(f"Adding last Conv 1D Layer" )
         model += [
             act(**activation_params),
             SConv1d(mult * n_filters, dimension, last_kernel_size, norm=norm, norm_kwargs=norm_params,
@@ -388,7 +135,6 @@ class EncodecEncoder(nn.Module):
     def forward(self, x):
         return self.model(x)
     
-
 
 ##############################################  Encodec Decoder ################################################
 ######################### This will take the encoder outputs and go into the decoder blocks to generate audio segments #################
@@ -426,13 +172,13 @@ class EncodecDecoder(nn.Module):
             If equal to 1.0, it means that all the trimming is done at the right.
         
     """
-    def  __init__(self, channels: int = 1, dimension: int = 128, n_filters: int = 32, n_residual_layers: int = 1,
-                  ratios: tp.List[int] = [8, 5, 4, 2], activation: str = 'ELU', activation_params: dict = {'alpha': 1.0},
-                  final_activation: tp.Optional[str] = None, final_activation_params: tp.Optional[dict] = None,
-                  norm: str = 'weight_norm', norm_params: tp.Dict[str, tp.Any] = {}, kernel_size: int = 7, last_kernel_size: int = 7,
-                  residual_kernel_size: int = 3, dilation_base: int = 2, causal: bool = False, pad_mode: str = 'reflect', 
-                  true_skip: bool = False, compress: int = 2, lstm: int = 2, 
-                trim_right_ratio: float = 1.0):
+    def __init__(self, channels: int = 1, dimension: int = 128, n_filters: int = 32, n_residual_layers: int = 1,
+                 ratios: tp.List[int] = [8, 5, 4, 2], activation: str = 'ELU', activation_params: dict = {'alpha': 1.0},
+                 final_activation: tp.Optional[str] = None, final_activation_params: tp.Optional[dict] = None,
+                 norm: str = 'none', norm_params: tp.Dict[str, tp.Any] = {}, kernel_size: int = 7,
+                 last_kernel_size: int = 7, residual_kernel_size: int = 3, dilation_base: int = 2, causal: bool = False,
+                 pad_mode: str = 'reflect', true_skip: bool = False, compress: int = 2, lstm: int = 2,
+                 trim_right_ratio: float = 1.0):
         super().__init__()
         self.dimension = dimension
         self.channels = channels
@@ -441,19 +187,14 @@ class EncodecDecoder(nn.Module):
         del ratios
         self.n_residual_layers = n_residual_layers
         self.hop_length = np.prod(self.ratios)
-        
+
         act = getattr(nn, activation)
-        
         mult = int(2 ** len(self.ratios))
-        
-        # define the decoder blocks 
         model: tp.List[nn.Module] = [
             SConv1d(dimension, mult * n_filters, kernel_size, norm=norm, norm_kwargs=norm_params,
                     causal=causal, pad_mode=pad_mode)
         ]
-        
-        
-        
+
         if lstm:
             model += [SLSTM(mult * n_filters, num_layers=lstm)]
 
@@ -467,7 +208,6 @@ class EncodecDecoder(nn.Module):
                                  norm=norm, norm_kwargs=norm_params,
                                  causal=causal, trim_right_ratio=trim_right_ratio),
             ]
-        
             # Add residual layers
             for j in range(n_residual_layers):
                 model += [
@@ -479,14 +219,12 @@ class EncodecDecoder(nn.Module):
 
             mult //= 2
 
-        
         # Add final layers
         model += [
             act(**activation_params),
             SConv1d(n_filters, channels, last_kernel_size, norm=norm, norm_kwargs=norm_params,
                     causal=causal, pad_mode=pad_mode)
         ]
-
         # Add optional final activation to decoder (eg. tanh)
         if final_activation is not None:
             final_act = getattr(nn, final_activation)
@@ -494,45 +232,320 @@ class EncodecDecoder(nn.Module):
             model += [
                 final_act(**final_activation_params)
             ]
-        # put all inside a Sequantial container 
         self.model = nn.Sequential(*model)
-        
-    ## input the encoder output 
+
     def forward(self, z):
         y = self.model(z)
         return y
+
+
 
 ################################ Encodec Encoder - Decoder #################################@@@
 #TODO
 
 class EncodecModel(nn.Module):
+    """EnCodec model operating on the raw waveform.
+    Args:
+        target_bandwidths (list of float): Target bandwidths.
+        encoder (nn.Module): Encoder network.
+        decoder (nn.Module): Decoder network.
+        sample_rate (int): Audio sample rate.
+        channels (int): Number of audio channels.
+        normalize (bool): Whether to apply audio normalization.
+        segment (float or None): segment duration in sec. when doing overlap-add.
+        overlap (float): overlap between segment, given as a fraction of the segment duration.
+        name (str): name of the model, used as metadata when compressing audio.
     """
     
+    def __init__(self, encoder: EncodecEncoder, decoder: EncodecDecoder, quantizer: ResidualVectorQuantizer, target_bandwidths: tp.List[float],
+                 sample_rate: int, channels: int, normalize: bool = False, segment: tp.Optional[float] = None, overlap: float = 0.01, 
+                 name: str = 'unset'):
+        super().__init__()
+        self.bandwidth: tp.Optional[float] = None
+        self.target_bandwidths = target_bandwidths
+        self.encoder = encoder
+        self.quantizer = quantizer
+        self.decoder = decoder
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.normalize = normalize
+        self.segment = segment
+        self.overlap = overlap
+        self.frame_rate = math.ceil(self.sample_rate / np.prod(self.encoder.ratios)) #75
+        self.name = name
+        self.bits_per_codebook = int(math.log2(self.quantizer.bins))
+        assert 2 ** self.bits_per_codebook == self.quantizer.bins, \
+            "quantizer bins must be a power of 2."
 
-    Args:
-        n_q (int): number of codebooks.
-        card (int): codebook cardinality.
-        dim (int): transformer dimension.
-        **kwargs: passed to `encodec.modules.transformer.StreamingTransformerEncoder`.
-    """
-    pass
-    # def __init__(self, n_q: int =32, card: int = 1024, dim: int = 200, **kwargs):
-    #     super().__init__()
-    #     self.card = card
-    #     self.n_q = n_q
-    #     self.dim = dim
-    #     self.transformer = None
-    #     self.emb = nn.ModuleList([nn.Embedding(card + 1, dim) for _ in range(n_q)])
-        
+
+    @property
+    def segment_length(self) -> tp.Optional[int]:
+        if self.segment is None:
+            return None
+        return int(self.segment * self.sample_rate)
+
+    @property
+    def segment_stride(self) -> tp.Optional[int]:
+        segment_length = self.segment_length
+        if segment_length is None:
+            return None
+        return max(1, int((1 - self.overlap) * segment_length))    
+
+
+    def encode(self, x: torch.Tensor) -> tp.List[EncodedFrame]:
+        """Given a tensor `x`, returns a list of frames containing
+        the discrete encoded codes for `x`, along with rescaling factors
+        for each segment, when `self.normalize` is True.
+
+        Each frames is a tuple `(codebook, scale)`, with `codebook` of
+        shape `[B, K, T]`, with `K` the number of codebooks.
+        """
+        assert x.dim() == 3
+        _, channels, length = x.shape
+        assert channels > 0 and channels <= 2
+        segment_length = self.segment_length 
+        if segment_length is None: #segment_length = 1*sample_rate
+            segment_length = length
+            stride = length
+        else:
+            stride = self.segment_stride  # type: ignore
+            assert stride is not None
+
+        encoded_frames: tp.List[EncodedFrame] = []
+        for offset in range(0, length, stride): # shift windows to choose data
+            frame = x[:, :, offset: offset + segment_length]
+            encoded_frames.append(self._encode_frame(frame))
+        return encoded_frames
+
+
+    def _encode_frame(self, x: torch.Tensor) -> EncodedFrame:
+        length = x.shape[-1] # tensor_cut or original
+        duration = length / self.sample_rate
+        assert self.segment is None or duration <= 1e-5 + self.segment
+
+        if self.normalize:
+            mono = x.mean(dim=1, keepdim=True)
+            volume = mono.pow(2).mean(dim=2, keepdim=True).sqrt()
+            scale = 1e-8 + volume
+            x = x / scale
+            scale = scale.view(-1, 1)
+        else:
+            scale = None
+
+        emb = self.encoder(x) # [2,1,10000] -> [2,128,32]
+        #TODO: Encodec Trainer的training
+        if self.training:
+            return emb,scale
+        codes = self.quantizer.encode(emb, self.frame_rate, self.bandwidth)
+        codes = codes.transpose(0, 1)
+        # codes is [B, K, T], with T frames, K nb of codebooks.
+        return codes, scale    
+
+    def decode(self, encoded_frames: tp.List[EncodedFrame]) -> torch.Tensor:
+        """Decode the given frames into a waveform.
+        Note that the output might be a bit bigger than the input. In that case,
+        any extra steps at the end can be trimmed.
+        """
+        segment_length = self.segment_length
+        if segment_length is None:
+            assert len(encoded_frames) == 1
+            return self._decode_frame(encoded_frames[0])
+
+        frames = [self._decode_frame(frame) for frame in encoded_frames]
+        return _linear_overlap_add(frames, self.segment_stride or 1)
+
+    def _decode_frame(self, encoded_frame: EncodedFrame) -> torch.Tensor:
+        codes, scale = encoded_frame
+        if self.training:
+            emb = codes
+        else:
+            codes = codes.transpose(0, 1)
+            emb = self.quantizer.decode(codes)
+        out = self.decoder(emb)
+        if scale is not None:
+            out = out * scale.view(-1, 1, 1)
+        return out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        frames = self.encode(x) # input_wav -> encoder , x.shape = [BatchSize,channel,tensor_cut or original length] 2,1,10000
+        if self.training:
+            # if encodec is training, input_wav -> encoder -> quantizer forward -> decode
+            loss_w = torch.tensor([0.0], device=x.device, requires_grad=True)
+            codes = []
+            # self.quantizer.train(self.training)
+            index = torch.tensor(random.randint(0,len(self.target_bandwidths)-1),device=x.device)
+            if torch.distributed.is_initialized():
+                torch.distributed.broadcast(index, src=0)
+            bw = self.target_bandwidths[index.item()]# fixme: variable bandwidth training, if you broadcast bd, the broadcast will encounter error
+            for emb,scale in frames:
+                qv = self.quantizer(emb,self.frame_rate,bw)
+                loss_w = loss_w + qv.penalty # loss_w is the sum of all quantizer forward loss (RVQ commitment loss :l_w)
+                codes.append((qv.quantized,scale))
+            return self.decode(codes)[:,:,:x.shape[-1]],loss_w,frames
+        else:
+            # if encodec is not training, input_wav -> encoder -> quantizer encode -> decode
+            return self.decode(frames)[:, :, :x.shape[-1]]
+
+    def set_target_bandwidth(self, bandwidth: float):
+        if bandwidth not in self.target_bandwidths:
+            raise ValueError(f"This model doesn't support the bandwidth {bandwidth}. "
+                             f"Select one of {self.target_bandwidths}.")
+        self.bandwidth = bandwidth
+
+    def get_lm_model(self) -> LMModel:
+        """Return the associated LM model to improve the compression rate.
+        """
+        device = next(self.parameters()).device
+        lm = LMModel(self.quantizer.n_q, self.quantizer.bins, num_layers=5, dim=200,
+                     past_context=int(3.5 * self.frame_rate)).to(device)
+        checkpoints = {
+            'encodec_24khz': 'encodec_lm_24khz-1608e3c0.th',
+            'encodec_48khz': 'encodec_lm_48khz-7add9fc3.th',
+        }
+        try:
+            checkpoint_name = checkpoints[self.name]
+        except KeyError:
+            raise RuntimeError("No LM pre-trained for the current Encodec model.")
+        url = _get_checkpoint_url(ROOT_URL, checkpoint_name)
+        state = torch.hub.load_state_dict_from_url(
+            url, map_location='cpu', check_hash=True)  # type: ignore
+        lm.load_state_dict(state)
+        lm.eval()
+        return lm
+
+    @staticmethod
+    def _get_model(target_bandwidths: tp.List[float],
+                   sample_rate: int = 24_000,
+                   channels: int = 1,
+                   causal: bool = True,
+                   model_norm: str = 'weight_norm',
+                   audio_normalize: bool = False,
+                   segment: tp.Optional[float] = None,
+                   name: str = 'unset',
+                   ratios=[8, 5, 4, 2]):
+        encoder = m.SEANetEncoder(channels=channels, norm=model_norm, causal=causal,ratios=ratios)
+        decoder = m.SEANetDecoder(channels=channels, norm=model_norm, causal=causal,ratios=ratios)
+        n_q = int(1000 * target_bandwidths[-1] // (math.ceil(sample_rate / encoder.hop_length) * 10)) # int(1000*24//(math.ceil(24000/320)*10))
+        quantizer = qt.ResidualVectorQuantizer(
+            dimension=encoder.dimension,
+            n_q=n_q,
+            bins=1024,
+        )
+        model = EncodecModel(
+            encoder,
+            decoder,
+            quantizer,
+            target_bandwidths,
+            sample_rate,
+            channels,
+            normalize=audio_normalize,
+            segment=segment,
+            name=name,
+        )
+        return model
+
+    @staticmethod
+    def _get_pretrained(checkpoint_name: str, repository: tp.Optional[Path] = None):
+        if repository is not None:
+            if not repository.is_dir():
+                raise ValueError(f"{repository} must exist and be a directory.")
+            file = repository / checkpoint_name
+            checksum = file.stem.split('-')[1]
+            _check_checksum(file, checksum)
+            return torch.load(file)
+        else:
+            url = _get_checkpoint_url(ROOT_URL, checkpoint_name)
+            return torch.hub.load_state_dict_from_url(url, map_location='cpu', check_hash=True)  # type:ignore
+
+    @staticmethod
+    def encodec_model_24khz(pretrained: bool = True, repository: tp.Optional[Path] = None):
+        """Return the pretrained causal 24khz model.
+        """
+        if repository:
+            assert pretrained
+        target_bandwidths = [1.5, 3., 6, 12., 24.]
+        checkpoint_name = 'encodec_24khz-d7cc33bc.th'
+        sample_rate = 24_000
+        channels = 1
+        model = EncodecModel._get_model(
+            target_bandwidths, sample_rate, channels,
+            causal=True, model_norm='weight_norm', audio_normalize=False,
+            name='encodec_24khz' if pretrained else 'unset')
+        if pretrained:
+            state_dict = EncodecModel._get_pretrained(checkpoint_name, repository)
+            model.load_state_dict(state_dict)
+        model.eval()
+        return model
+
+    @staticmethod
+    def encodec_model_48khz(pretrained: bool = True, repository: tp.Optional[Path] = None):
+        """Return the pretrained 48khz model.
+        """
+        if repository:
+            assert pretrained
+        target_bandwidths = [3., 6., 12., 24.]
+        checkpoint_name = 'encodec_48khz-7e698e3e.th'
+        sample_rate = 48_000
+        channels = 2
+        model = EncodecModel._get_model(
+            target_bandwidths, sample_rate, channels,
+            causal=False, model_norm='time_group_norm', audio_normalize=True,
+            segment=1., name='encodec_48khz' if pretrained else 'unset')
+        if pretrained:
+            state_dict = EncodecModel._get_pretrained(checkpoint_name, repository)
+            model.load_state_dict(state_dict)
+        model.eval()
+        return model
+
+    @staticmethod
+    def my_encodec_model(checkpoint: str,ratios=[8,5,4,2]):
+        """Return the pretrained 24khz model.
+        """
+        import os
+        assert os.path.exists(checkpoint), "checkpoint not exists"
+        print("loading model from: ",checkpoint)
+        target_bandwidths = [1.5, 3., 6, 12., 24.]
+        sample_rate = 24_000
+        channels = 1
+        model = EncodecModel._get_model(
+                target_bandwidths, sample_rate, channels,
+                causal=False, model_norm='time_group_norm', audio_normalize=True,
+                segment=None, name='my_encodec',ratios=ratios)
+        pre_dic = torch.load(checkpoint)['model_state_dict']
+        model.load_state_dict({k.replace('quantizer.model','quantizer.vq'):v for k,v in pre_dic.items()})
+        model.eval()
+        return model
+    
+    @staticmethod
+    def encodec_model_bw(checkpoint: str, bandwidth: float):
+        """Return target bw model, if you train a model in a single bandwidth
+        """
+        import os
+        assert os.path.exists(checkpoint), "checkpoint not exists"
+        print("loading model from: ",checkpoint)
+        target_bandwidths = bandwidth
+        sample_rate = 24_000
+        channels = 1
+        model = EncodecModel._get_model(
+                target_bandwidths, sample_rate, channels,
+                causal=False, model_norm='time_group_norm', audio_normalize=True,
+                segment=1., name='my_encodec')
+        pre_dic = torch.load(checkpoint)['model_state_dict']
+        model.load_state_dict({k.replace('quantizer.model','quantizer.vq'):v for k,v in pre_dic.items()})
+        model.eval()
+        return model
+
 
 def test_encoder():
     encoder = EncodecEncoder()
     x = torch.randn(1, 1, 24000)
+# The above code snippet is calling a function `encoder` with input `x`, and then printing the shape
+# of the output `z`. It also includes an assertion to check if the shape of `z` is equal to [1, 128,
+# 75]. If the assertion fails, it will raise an AssertionError with the actual shape of `z`.
     z = encoder(x)
     print(z.shape)
     assert list(z.shape) == [1, 128, 75], z.shape
     
- 
 def test_decoder():
     decoder = EncodecDecoder()
     x = torch.randn(1, 1, 24000)
@@ -546,12 +559,14 @@ def test_enc_dec():
     decoder = EncodecDecoder()
     
     x = torch.randn(1, 1, 24000)
+    print("input shape", x.shape)
     z = encoder(x)
+    print("Encoder done ................ ")
+    print("Encoder output shape", z.shape)
     assert list(z.shape) == [1, 128, 75], z.shape
     y = decoder(z)
-    assert list(y.shape) == x.shape, (x.shape, y.shape)
-    
-        
+    print("Decoder output shape", y.shape)
+    assert y.shape == x.shape, (x.shape, y.shape)      
         
 if __name__ == '__main__':
-    test_decoder()
+    test_enc_dec()

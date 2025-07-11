@@ -14,7 +14,7 @@ __set_seed: !apply:speechbrain.utils.seed_everything [!ref <seed>]
 output_folder: !ref /home/fbougares/jsalt25/speechbrain_exps/results/encodec/<seed>
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
-epochs: 700
+epochs: 2
 keep_checkpoint_interval: 50
 use_tensorboard: False
 
@@ -73,22 +73,8 @@ test_split: ["test-clean"]
 text_cleaners: ['english_cleaners']
 
 # Avoid audios longer than x seconds
-avoid_if_longer_than: 10.0
-################################
-# Audio Parameters             #
-################################
-sample_rate: 24000
-hop_length: 256
-win_length: 1024
-n_mel_channels: 80
-n_fft: 1024
-mel_fmin: 0.0
-mel_fmax: 8000.0
-mel_normalized: False
-power: 1
-norm: "slaney"
-mel_scale: "slaney"
-dynamic_range_compression: True
+avoid_if_longer_than: 10000.0
+
 
 ################################
 # Speaker Embedding Parameters #
@@ -168,6 +154,37 @@ postnet_embedding_dim: 1024
 postnet_kernel_size: 5
 postnet_n_convolutions: 10
 
+
+########################################### FETHI ##########################################@@
+################################
+# Audio Parameters             #
+################################
+sample_rate: 24_000
+hop_length: 256
+win_length: 1024
+n_mel_channels: 80
+n_fft: 1024
+mel_fmin: 0.0
+mel_fmax: 8000.0
+mel_normalized: False
+power: 1
+norm: "slaney"
+mel_scale: "slaney"
+dynamic_range_compression: True
+
+
+channels: 1
+target_bandwidths: [3., 6., 12., 24.]
+causal: True
+model_norm: "weight_norm"
+audio_normalize: False
+segment: "None"
+name: "unset"
+ratios: [8, 5, 4, 2]
+
+
+
+
 # To compute the mel-spectrogram for an audio
 mel_spectogram: !name:speechbrain.lobes.models.HifiGAN.mel_spectogram
   sample_rate: !ref <sample_rate>
@@ -185,6 +202,17 @@ mel_spectogram: !name:speechbrain.lobes.models.HifiGAN.mel_spectogram
 
 
 encoder: !new:speechbrain.lobes.models.Encodec.EncodecEncoder
+
+quantizer: !new:speechbrain.quantization.vq.ResidualVectorQuantizer
+  dimension: 256
+  n_q: 8
+  bins: 1024
+  decay: 0.99
+  kmeans_init: True
+  kmeans_iters: 50
+  threshold_ema_dead_code: 2
+
+decoder: !new:speechbrain.lobes.models.Encodec.EncodecDecoder
 
   # channels: 1 #!ref <>
   # dimension: 128 #!ref <>
@@ -204,12 +232,21 @@ encoder: !new:speechbrain.lobes.models.Encodec.EncodecEncoder
 # Overall modules used
 modules:
   encoder: !ref <encoder>
+  quantizer: !ref <quantizer> 
+  decoder: !ref <decoder>
+
+
+model: !new:torch.nn.ModuleList
+  - [!ref <encoder>, !ref <decoder>]
+
 
 # Optimizer
 opt_class: !name:torch.optim.Adam
   lr: !ref <learning_rate>
   weight_decay: !ref <weight_decay>
 
+
+loss_mel_spec: !name:torch.nn.functional.
 # To keep track of the epochs
 epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
   limit: !ref <epochs>

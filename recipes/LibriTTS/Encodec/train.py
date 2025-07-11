@@ -13,10 +13,9 @@ import sys
 import torch
 import torchaudio
 from hyperpyyaml import load_hyperpyyaml
+import torch.nn.functional as F
 
 import speechbrain as sb
-from speechbrain.inference.vocoders import HIFIGAN
-from speechbrain.utils.data_utils import scalarize
 from speechbrain.utils.logger import get_logger
 from speechbrain.utils.text_to_sequence import text_to_sequence
 
@@ -25,6 +24,26 @@ logger = get_logger(__name__)
 
 class EncodecBrain(sb.Brain):
     """The Brain implementation for Encodec"""
+
+    def trim_prediction_to_match_input_audio(self, x, size: int):
+        return x.narrow(2,0,size)
+    
+    def reconstruction_loss(self, x, y, eps = 1e-7):
+        time_domain_loss = F.l1_loss(x, y)
+        
+        mel_x = hparams["mel_spectogram"](audio=x)
+        mel_y = hparams["mel_spectogram"](audio=y)
+        
+        freq_domain_loss = (mel_x - mel_y).abs().mean()
+
+        return time_domain_loss+ freq_domain_loss
+    
+    def feature_loss(self, fmap_r, fmap_g):
+        loss = 0
+        for dr, dg in zip(fmap_r, fmap_g):
+            for rl, gl in zip(dr, dg):
+                loss += torch.mean(torch.abs(rl - gl))
+        return loss
     
     def compute_forward(self, batch, stage):
         """
@@ -44,22 +63,24 @@ class EncodecBrain(sb.Brain):
         
         batch = batch.to(self.device)
         wavs, wav_lens = batch.audio
-        print("Input wav shape", wavs.shape)
-        feats = self.modules.encoder(wavs)
         
-        print("Feats shape", feats.shape)
+        encoder = self.modules.encoder
+        quantizer = self.modules.quantizer
+        decoder = self.modules.decoder
         
-        return feats
+        latents = encoder(wavs)
+        y = decoder(latents)
 
+        return y, wav_lens
     
-    def compute_objectives(self, batch, stage):
+    def compute_objectives(self, predictions, batch, stage):
         """
-        Computes the loss given the predicted and targeted outputs
+        Computes the loss given the predicted (wav form) and target (wav form)
 
         Arguments
         ---------
         predictions : torch.Tensor
-            The model generated mel-spectrograms and other metrics from `compute_forward`
+            The model generated wav form and other metrics from `compute_forward`
         batch : PaddedBatch
             This batch object contains all the relevant tensors for computation
         stage : sb.Stage
@@ -70,12 +91,24 @@ class EncodecBrain(sb.Brain):
         loss : torch.Tensor
             A one-element tensor used for back-propagating the gradient
         """
-        wav, wav_lens = batch
-        
+        batch = batch.to(self.device)
+        mel_spec = batch.mel_spec
 
-    def fit_batch(self, batch):
-        feats = self.compute_forward(batch, sb.Stage.TRAIN)
-        return feats
+        y, _ = predictions
+        
+        y_narrowed = (self.trim_prediction_to_match_input_audio(y, batch.audio.data.shape[-1]))
+
+        # We have original mel_spectro and generate mel_spectro
+        loss = F.mse_loss(y_narrowed, batch.audio[0])  #self.feature_loss(batch.audio.data, y)#y_mel_spec.detach(),mel_spec)
+        
+        return self.reconstruction_loss(y_narrowed, batch.audio[0])
+
+    def init_optimizers(self):
+        
+        self.optimizer = self.hparams.opt_class(
+            self.hparams.model.parameters()
+        )
+        
     
 ############### The data preparation method ########################
 def dataio_prepare(hparams):
@@ -86,6 +119,8 @@ def dataio_prepare(hparams):
     def audio_pipeline(wav):
 
         audio, sig_sr = torchaudio.load(wav)
+        
+        #audio = F.pad( audio, (0, (24000 - audio.size(-1))), "constant" )
         if sig_sr != hparams["sample_rate"]:
             audio = torchaudio.functional.resample(
                 audio, sig_sr, hparams["sample_rate"]
@@ -107,14 +142,14 @@ def dataio_prepare(hparams):
             csv_path=data_info[dataset],
             replacements={"data_root": hparams["data_folder"]},
             dynamic_items=[audio_pipeline],
-            output_keys=["mel_spec", "audio"],
+            output_keys=["mel_spec", "id", "audio"],
         )
 
         datasets[dataset] = datasets[dataset].filtered_sorted(
             key_max_value={"duration": hparams["avoid_if_longer_than"]},
         )
 
-    return datasets        
+    return datasets       
         
 
 if __name__ == '__main__':
