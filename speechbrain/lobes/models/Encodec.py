@@ -13,6 +13,7 @@ import math
 import torch
 import einops
 import warnings
+import random
 import numpy as np
 import typing as tp
 from torch import nn
@@ -241,7 +242,6 @@ class EncodecDecoder(nn.Module):
 
 
 ################################ Encodec Encoder - Decoder #################################@@@
-#TODO
 
 class EncodecModel(nn.Module):
     """EnCodec model operating on the raw waveform.

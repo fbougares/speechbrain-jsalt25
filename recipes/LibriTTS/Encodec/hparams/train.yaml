@@ -204,7 +204,7 @@ mel_spectogram: !name:speechbrain.lobes.models.HifiGAN.mel_spectogram
 encoder: !new:speechbrain.lobes.models.Encodec.EncodecEncoder
 
 quantizer: !new:speechbrain.quantization.vq.ResidualVectorQuantizer
-  dimension: 256
+  dimension: 128
   n_q: 8
   bins: 1024
   decay: 0.99
@@ -213,6 +213,16 @@ quantizer: !new:speechbrain.quantization.vq.ResidualVectorQuantizer
   threshold_ema_dead_code: 2
 
 decoder: !new:speechbrain.lobes.models.Encodec.EncodecDecoder
+
+
+disc_model: !new:speechbrain.lobes.models.msstftd.MultiScaleSTFTDiscriminator
+  in_channels: 1
+  out_channels: 1
+  filters: 32 
+  hop_lengths: [256, 512, 128] 
+  win_lengths: [1024, 2048, 512]
+  n_ffts: [1024, 2048, 512]
+
 
   # channels: 1 #!ref <>
   # dimension: 128 #!ref <>
@@ -232,8 +242,9 @@ decoder: !new:speechbrain.lobes.models.Encodec.EncodecDecoder
 # Overall modules used
 modules:
   encoder: !ref <encoder>
-  quantizer: !ref <quantizer> 
+  quantizer: !ref <quantizer>
   decoder: !ref <decoder>
+  disc_model: !ref <disc_model>
 
 
 model: !new:torch.nn.ModuleList

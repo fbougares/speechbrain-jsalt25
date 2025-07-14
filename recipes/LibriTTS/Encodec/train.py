@@ -16,8 +16,15 @@ from hyperpyyaml import load_hyperpyyaml
 import torch.nn.functional as F
 
 import speechbrain as sb
+
+from speechbrain.lobes.models.Encodec import EncodecModel
+from speechbrain.lobes.models.Encodec_losses import total_loss, disc_loss
+
 from speechbrain.utils.logger import get_logger
 from speechbrain.utils.text_to_sequence import text_to_sequence
+from speechbrain.utils.data_utils import scalarize
+
+
 
 logger = get_logger(__name__)
 
@@ -62,16 +69,31 @@ class EncodecBrain(sb.Brain):
         """
         
         batch = batch.to(self.device)
-        wavs, wav_lens = batch.audio
+        input_wavs, wav_lens = batch.audio
         
         encoder = self.modules.encoder
         quantizer = self.modules.quantizer
         decoder = self.modules.decoder
+        disc_model = self.modules.disc_model
         
-        latents = encoder(wavs)
-        y = decoder(latents)
+        target_bandwidths = [1.5, 3., 6, 12., 24.]
+        sample_rate = 24_000
+        channels = 1
+        
+        
+        # putting all together : encoder - quantizer - decoder 
+        model = EncodecModel(encoder, decoder, quantizer, target_bandwidths, sample_rate, channels)
+        
+    
+        output, loss_w, _ = model(input_wavs)
+        
+        ### Doc : loss_w is the sum of all quantizer forward loss (RVQ commitment loss :l_w)
+        logits_real, fmap_real = disc_model(input_wavs)
+        logits_fake, fmap_fake = disc_model(output.detach()) # detach to avoid backpropagation to model
+        
 
-        return y, wav_lens
+
+        return output, loss_w, logits_real, fmap_real, logits_fake, fmap_fake, sample_rate
     
     def compute_objectives(self, predictions, batch, stage):
         """
@@ -91,24 +113,78 @@ class EncodecBrain(sb.Brain):
         loss : torch.Tensor
             A one-element tensor used for back-propagating the gradient
         """
+        
         batch = batch.to(self.device)
-        mel_spec = batch.mel_spec
-
-        y, _ = predictions
+        input_wavs, wav_lens = batch.audio
         
-        y_narrowed = (self.trim_prediction_to_match_input_audio(y, batch.audio.data.shape[-1]))
-
-        # We have original mel_spectro and generate mel_spectro
-        loss = F.mse_loss(y_narrowed, batch.audio[0])  #self.feature_loss(batch.audio.data, y)#y_mel_spec.detach(),mel_spec)
+        (
+            
+            y_hat,
+            loss_w,    # This is the sum of all quantizer forward losses (RVQ commitment loss :l_w)
+            logits_real,
+            fmap_real,
+            logits_fake,
+            fmap_fake,
+            sample_rate,
+            
+        ) = predictions
         
-        return self.reconstruction_loss(y_narrowed, batch.audio[0])
+        
+        ### LOSS GENERATOR ########
+        
+        # Generator Losses (model waudio prediction) total loss of fmap (mel spec) and logits 
+        losses_g = total_loss(
+                fmap_real, 
+                logits_fake, 
+                fmap_fake, 
+                input_wavs, 
+                y_hat, 
+                sample_rate=sample_rate,
+            ) 
+        
+        # without balancer: loss = 3*l_g + 3*l_feat + (l_t / 10) + l_f
+        # loss_g = torch.tensor([0.0], device='cuda', requires_grad=True)
+        loss_g = 3*losses_g['l_g'] + 3*losses_g['l_feat'] + losses_g['l_t']/10 + losses_g['l_f'] 
+        
+        
+        ### LOSS DISCRIMINATOR  ##
+        loss_disc = disc_loss(logits_real, logits_fake) # compute discriminator loss
+        
+
+
+        loss = {**loss_g, **loss_w, **loss_disc}            
+
+        self.last_loss_stats[stage] = scalarize(loss)
+        
+        return loss
 
     def init_optimizers(self):
+        """
+        Called during ``on_fit_start()``, initialize optimizers
+        after parameters are fully configured (e.g. DDP, jit).
+        """
+        # Initialize variables to accumulate losses  
+        #accumulated_loss_g = 0.0
+        #accumulated_losses_g = defaultdict(float)
+        #accumulated_loss_w = 0.0
+        #accumulated_loss_disc = 0.0
         
         self.optimizer = self.hparams.opt_class(
             self.hparams.model.parameters()
         )
         
+    def on_fit_start(self):
+        """
+        Gets called at the beginning of ``fit()``, on multiple processes
+        if ``distributed_count > 0`` and backend is ddp and initializes statistics.
+        """
+        self.last_epoch = 0
+        self.last_batch = None
+        self.last_loss_stats = {}
+        
+        
+        
+        return super().on_fit_start()
     
 ############### The data preparation method ########################
 def dataio_prepare(hparams):
