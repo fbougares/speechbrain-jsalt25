@@ -18,10 +18,7 @@ epochs: 2
 keep_checkpoint_interval: 50
 use_tensorboard: False
 
-# Vocoder is used to convert the intermediate mel-spectrogram into the final waveform
-log_audio_samples: True
-vocoder: speechbrain/tts-hifigan-libritts-16kHz
-vocoder_savedir: tmpdir_vocoder_16k
+
 
 ###################################
 # Progress Samples                #
@@ -76,32 +73,20 @@ text_cleaners: ['english_cleaners']
 avoid_if_longer_than: 10000.0
 
 
-################################
-# Speaker Embedding Parameters #
-################################
-spk_emb_size: 192
-spk_emb_sample_rate: 16000
-custom_mel_spec_encoder: False
-spk_emb_encoder: speechbrain/spkrec-ecapa-voxceleb
-
-# To use the custom mel-spectrogram based encoder - for compatibility with future speaker consistency loss work
-# 1. Change "custom_mel_spec_encoder" to True
-# 2. Change the path for "spk_emb_encoder".
-# The ECAPA-TDNN model used for the Zero-Shot Multi-Speaker Tacotron2 experiments is available here: speechbrain/spkrec-ecapa-voxceleb-mel-spec
 
 ################################
 # Optimization Hyperparameters #
 ################################
-learning_rate: 0.001
+
+
+lr_scheduler:
+  warmup_epoch: 5
+
+learning_rate: 3e-4
+disc_learning_rate: 3e-4
 weight_decay: 0.000006
 batch_size: 1 #minimum 2
-mask_padding: True
-guided_attention_sigma: 0.2
-guided_attention_weight: 25.0
-guided_attention_weight_half_life: 25.
-guided_attention_hard_stop: 50
-gate_loss_weight: 1.0
-spk_emb_loss_weight: 1.0
+
 
 train_dataloader_opts:
   batch_size: !ref <batch_size>
@@ -113,7 +98,6 @@ valid_dataloader_opts:
   drop_last: True
   num_workers: 0
 
-
 test_dataloader_opts:
   batch_size: !ref <batch_size>
   drop_last: True
@@ -122,39 +106,6 @@ test_dataloader_opts:
 ###############################
 # Model Parameters and model  #
 ###############################
-n_symbols: 148 #fixed depending on symbols in textToSequence
-symbols_embedding_dim: 1024
-
-# Encoder parameters
-encoder_kernel_size: 5
-encoder_n_convolutions: 6
-encoder_embedding_dim: 1024
-
-# Decoder parameters
-# The number of frames in the target per encoder step
-n_frames_per_step: 1
-decoder_rnn_dim: 2048
-prenet_dim: 512
-max_decoder_steps: 1500
-gate_threshold: 0.5
-p_attention_dropout: 0.1
-p_decoder_dropout: 0.1
-decoder_no_early_stopping: False
-
-# Attention parameters
-attention_rnn_dim: 2048
-attention_dim: 256
-
-# Location Layer parameters
-attention_location_n_filters: 32
-attention_location_kernel_size: 31
-
-# Mel-post processing network parameters
-postnet_embedding_dim: 1024
-postnet_kernel_size: 5
-postnet_n_convolutions: 10
-
-
 ########################################### FETHI ##########################################@@
 ################################
 # Audio Parameters             #
@@ -248,16 +199,19 @@ modules:
 
 
 model: !new:torch.nn.ModuleList
-  - [!ref <encoder>, !ref <decoder>]
+  - [!ref <encoder>, !ref <quantizer>, !ref <decoder>]
 
 
 # Optimizer
-opt_class: !name:torch.optim.Adam
+model_opt_class: !name:torch.optim.Adam
   lr: !ref <learning_rate>
-  weight_decay: !ref <weight_decay>
+
+disc_opt_class: !name:torch.optim.Adam
+  lr: !ref <disc_learning_rate>
 
 
-loss_mel_spec: !name:torch.nn.functional.
+##>>>>  loss_mel_spec: !name:torch.nn.functional.
+
 # To keep track of the epochs
 epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
   limit: !ref <epochs>
@@ -267,17 +221,31 @@ train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
   save_file: !ref <train_log>
 
 # # Learning rate annealing function
-lr_annealing: !new:speechbrain.nnet.schedulers.NoamScheduler
-  lr_initial: !ref <learning_rate>
-  n_warmup_steps: 4000
+lr_annealing: !new:speechbrain.models.scheduler.WarmupCosineLrScheduler
+  max_iter: 100000 # should be max_epoch*len(trainloader)
+  eta_ratio: 0,
+  warmup_iter: 500,
+  warmup_ratio: 5e-4,
+  warmup: 'exp',
+  last_epoch: -1,
+
+lr_annealing_disc: !new:speechbrain.models.scheduler.WarmupCosineLrScheduler
+  max_iter: 100000 # should be max_epoch*len(trainloader)
+  eta_ratio: 0,
+  warmup_iter: 500,
+  warmup_ratio: 5e-4,
+  warmup: 'exp',
+  last_epoch: -1,
 
 # Checkpointer
 checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
   checkpoints_dir: !ref <save_folder>
   recoverables:
-    model: !ref <encoder>
+    model: !ref <model>
+    disc_model: !ref <disc_model>
+    scheduler_model: !ref <lr_annealing>
+    scheduler_disc: !ref <lr_annealing_disc>
     counter: !ref <epoch_counter>
-    scheduler: !ref <lr_annealing>
 
 # Progress sample logger
 progress_sample_logger: !new:speechbrain.utils.train_logger.ProgressSampleLogger

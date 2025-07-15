@@ -12,6 +12,7 @@ import sys
 
 import torch
 import torchaudio
+from collections import defaultdict
 from hyperpyyaml import load_hyperpyyaml
 import torch.nn.functional as F
 
@@ -35,26 +36,10 @@ class EncodecBrain(sb.Brain):
     def trim_prediction_to_match_input_audio(self, x, size: int):
         return x.narrow(2,0,size)
     
-    def reconstruction_loss(self, x, y, eps = 1e-7):
-        time_domain_loss = F.l1_loss(x, y)
-        
-        mel_x = hparams["mel_spectogram"](audio=x)
-        mel_y = hparams["mel_spectogram"](audio=y)
-        
-        freq_domain_loss = (mel_x - mel_y).abs().mean()
-
-        return time_domain_loss+ freq_domain_loss
-    
-    def feature_loss(self, fmap_r, fmap_g):
-        loss = 0
-        for dr, dg in zip(fmap_r, fmap_g):
-            for rl, gl in zip(dr, dg):
-                loss += torch.mean(torch.abs(rl - gl))
-        return loss
-    
     def compute_forward(self, batch, stage):
         """
-        Computes the forward pass
+        The forward function, generates synthesized waveforms,
+        calculates the scores and the features of the discriminator for real and synthesized waveforms.
 
         Arguments
         ---------
@@ -63,9 +48,12 @@ class EncodecBrain(sb.Brain):
             stage: speechbrain.Stage
                 the training stage
 
-            Returns
+        Returns 
         -------
-        the model output
+        Generator audio output : output
+        Quantizer loss : loss_w 
+        Generator output : logits_real / fmap_real 
+        Discriminator outputs : logits_fake/ fmap_fake.
         """
         
         batch = batch.to(self.device)
@@ -84,15 +72,12 @@ class EncodecBrain(sb.Brain):
         # putting all together : encoder - quantizer - decoder 
         model = EncodecModel(encoder, decoder, quantizer, target_bandwidths, sample_rate, channels)
         
-    
         output, loss_w, _ = model(input_wavs)
         
         ### Doc : loss_w is the sum of all quantizer forward loss (RVQ commitment loss :l_w)
         logits_real, fmap_real = disc_model(input_wavs)
         logits_fake, fmap_fake = disc_model(output.detach()) # detach to avoid backpropagation to model
         
-
-
         return output, loss_w, logits_real, fmap_real, logits_fake, fmap_fake, sample_rate
     
     def compute_objectives(self, predictions, batch, stage):
@@ -130,6 +115,7 @@ class EncodecBrain(sb.Brain):
         ) = predictions
         
         
+        
         ### LOSS GENERATOR ########
         
         # Generator Losses (model waudio prediction) total loss of fmap (mel spec) and logits 
@@ -150,34 +136,92 @@ class EncodecBrain(sb.Brain):
         ### LOSS DISCRIMINATOR  ##
         loss_disc = disc_loss(logits_real, logits_fake) # compute discriminator loss
         
-
-
-        loss = {**loss_g, **loss_w, **loss_disc}            
-
-        self.last_loss_stats[stage] = scalarize(loss)
+        self.accumulated_loss_g += loss_g.item()
+        for k, l in losses_g.items():
+            self.accumulated_losses_g[k] += l.item()
+        
+        self.accumulated_loss_w += loss_w.item()
+        
+        self.accumulated_loss_disc += loss_disc.item()
+        
+        self.last_loss_stats[stage] = {"accumulated_loss_w": self.accumulated_loss_w,
+                                       "loss_G": self.accumulated_loss_g,
+                                       "loss_disc":self.accumulated_loss_disc}
+        
+        loss = {**loss_g, **loss_w, **loss_disc}
         
         return loss
+
+    def on_stage_start(self, stage, epoch=None):
+        """
+        Gets called at the beginning of each epoch.
+
+        Args:
+            stage : sb.Stage / One of sb.Stage.TRAIN, sb.Stage.VALID, or sb.Stage.TEST.
+            epoch (int, optional): The currently-starting epoch. This is passed `None` during the test stage.
+        """
+        # Set up statistics trackers for this stage
+        self.last_loss_stats = {}
+        
+    def on_stage_end(self, stage, stage_loss, epoch):
+        """
+        Gets called at the end of an epoch
+        stage : sb.Stage / One of sb.Stage.TRAIN, sb.Stage.VALID, or sb.Stage.TEST.
+        stage_loss : float / The average loss for all of the data processed in this stage.
+        epoch : int / The currently-starting epoch. This is passed `None` during the test stage.
+        
+        """
+        
+        # At the end of validation, we can write
+        if stage == sb.Stage.VALID:
+            # Update learning rate
+            lr = self.optimizer.param_groups[-1]["lr"]
+            lr_disc = self.optimizer_disc.param_groups[-1]["lr"]
+            self.last_epoch = epoch
+            # The train_logger writes a summary to stdout and to the logfile.
+            self.hparams.train_logger.log_stats(  # 1#2#
+                                                stats_meta={"Epoch": epoch, "lr": lr, "lr_disc": lr_disc},
+                                                train_stats=self.last_loss_stats[sb.Stage.TRAIN],
+                                                valid_stats=self.last_loss_stats[sb.Stage.VALID],
+            )
+        
 
     def init_optimizers(self):
         """
         Called during ``on_fit_start()``, initialize optimizers
         after parameters are fully configured (e.g. DDP, jit).
-        """
-        # Initialize variables to accumulate losses  
-        #accumulated_loss_g = 0.0
-        #accumulated_losses_g = defaultdict(float)
-        #accumulated_loss_w = 0.0
-        #accumulated_loss_disc = 0.0
-        
-        self.optimizer = self.hparams.opt_class(
+        """        
+        self.optimizer = self.hparams.model_opt_class(
             self.hparams.model.parameters()
         )
         
+        self.optimizer_disc = self.hparams.disc_opt_class(
+            self.hparams.disc_model.parameters()
+        )
+        
+        self.optimizers_dict = {
+                "optimizer": self.optimizer,
+                "optimizer_disc": self.optimizer_disc,
+            }
+        
+        if self.checkpointer is not None:
+                self.checkpointer.add_recoverable(
+                    "optimizer", self.optimizer
+                )
+                self.checkpointer.add_recoverable(
+                    "optimizer_disc", self.optimizer_disc
+                )
+
     def on_fit_start(self):
         """
         Gets called at the beginning of ``fit()``, on multiple processes
         if ``distributed_count > 0`` and backend is ddp and initializes statistics.
         """
+        # Initialize variables to accumulate losses  
+        self.accumulated_loss_g = 0.0
+        self.accumulated_losses_g = defaultdict(float)
+        self.accumulated_loss_w = 0.0
+        self.accumulated_loss_disc = 0.0
         self.last_epoch = 0
         self.last_batch = None
         self.last_loss_stats = {}
@@ -268,11 +312,10 @@ if __name__ == '__main__':
                 "model_name": hparams["model"].__class__.__name__,
             },
         )
-        
     
     datasets = dataio_prepare(hparams)
     
-        # Brain class initialization
+    # Brain class initialization
     encodec_brain = EncodecBrain(
         modules=hparams["modules"],
         opt_class=hparams["opt_class"],
@@ -281,8 +324,7 @@ if __name__ == '__main__':
         checkpointer=hparams["checkpointer"],
     )
     
-    
-        # Training
+    # Training
     encodec_brain.fit(
         encodec_brain.hparams.epoch_counter,
         train_set=datasets["train"],
@@ -290,7 +332,6 @@ if __name__ == '__main__':
         train_loader_kwargs=hparams["train_dataloader_opts"],
         valid_loader_kwargs=hparams["valid_dataloader_opts"],
     )
-    
     
     # # Test
     # if "test" in datasets:
